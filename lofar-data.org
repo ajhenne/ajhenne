@@ -1,0 +1,328 @@
+#+title: Radio Data
+#+OPTIONS: overview
+
+* POSSIBLE ISSUES
+
+** Failing on download_target_skymodel
+*** Wrong download URL
+Edit $LINCDIR/scripts/download_skymodel_target.py
+Line 120 - change URL ~gsmv4~ to ~gsmv5~
+*** A different wrong download URL?
+Finds an error 302 on normal URL with cgi, then tries and fails on same URL but acgi.
+Checking the python files I can't find any reference to acgi - it should just true cgi x5 then fail if this isn't valid but instead tries cgi then acgi 5 times.
+In this case, just follow the actual URL to the page. Create file target.skymodel somewhere in the directory, and add to target.json:
+~"target_skymodel": {"class": "File", "path": "/path/to/target.skymodel"}~
+
+** Failing on target/structure_function
+Usually due to flagged data making some or all bands band, or totally deleted.
+To .json add ~'make_structure_function': false~
+
+* LINC
+
+The software for processing LOFAR data.
+
+Pipeline documents: [[https://linc.readthedocs.io/en/latest/]]
+
+** Installation
+
+LINC is the pipeline for processing LOFAR data. Data can be obtained from the LTA, from the averaging sections.
+
+*** Download LINC workflow files
+~git clone https://git.astron.nl/RD/LiNC.git <install dir>~
+
+*** Install cwltool
+You shoul be using Python 3 for this.
+~pip install cwltool cwl-runner~
+
+*** Obtaining Singularity container
+There are two methods of running LINC - run cwltool which will fetch the software container automatically, or run cwltool from within the singularity container. I've had more success with the latter option.
+
+On Leicester HPC, load singularity. f
+~module load apptainer # this may now be updated with ALICE3~
+~apptainer pull docker://astronrd/linc~
+
+** Running
+
+Assuming you've already got the measurement sets downloaded.
+
+*** Create JSON input file
+At simplest, ths file is just pointing to all measurement sets. Check the documentation for full options but defaults are usually fine. Otherwise, create a JSON file listing all calibration (or later target) data.
+#+BEGIN_EXAMPLE
+{
+    "msin": [
+        {"class": "Directory", "path": "/path/to/data_01.MS"},
+        {"class": "Directory", 'path": "/path/to/data_02.MS"},
+        ...
+    ]
+}
+#+END_EXAMPLE
+Ensure only to select the correct calibration or target files for the pipeline you're running - calib first, then target.
+
+*** Start LINC pipeline
+An example script of running LINC   .
+
+Singualrity command:
+#+BEGIN_src bash
+singularity exec --bind /scratch:/scratch
+cwltool \
+--outdir /path/to/cwd/outdir/ \
+--logdir /path/to/cwd/logdir/ \
+--preserve-entire-environment \
+--parallel \
+--no-container \
+<path_to_cwl_files>/workflows/HBA_calibrator.cwl \ # or HBA_target.cwltool
+/path/to/input.json > logs.txt 2>&1
+#+END_src
+
+Depending on the size of the data files and speed of processing, each pipeline can take 3-7 hours, closer to 7 if using debugging options.
+
+**** Debugging
+
+Include these options for debugging.
+#+BEGIN_src bash
+--debug
+--tmpdir-prefix /path/to/cwd/tempdir/
+--preserve-entire-environment
+--leave-tmpdir
+#+END_src
+
+**** Full Leicester submission script
+#+BEGIN_src bash
+#!/bin/bash
+
+#SBATCH --job_name=cal_200416a
+#SBATCH --nodes=1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=128gb
+#SBATCH --time=08:00:00
+#SBATCH --mail-type=BEGIN,END,FAIL
+#SBATCH --mail-user=ah724@leicester.ac.uk
+#SBATCH --export=Non
+#SBATCH --account=grbemission
+
+module load apptainer
+
+export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
+export LINC_DIR=/scratch/grbemission/ah724/linc_files
+export WORK_DIR=/scratch/grbemission/ah724/LOFAR_Followup/GRB200416A
+cd $WORK_DIR
+
+apptainer exec --bind /scratch:/scratch \
+    $LINC_DIR/linc_latest.sif \
+    cwltool \
+        --outdir "/calibration_pipeline/outdir" \
+        --logdir "/calibration_pipeline/logdir" \
+        --preserve-entire-environment \
+        --parallel \
+        --no-container \
+        $LINC_DIR/LINC/workflows/HBA_calibrator.cwl \
+        input_calib.json
+#+END_src
+
+*** Target pipeline
+The process is mostly the same. The JSON file now needs to give a list of the target files. In the submission script, ~HBA_calibrator.cwl~ should now be ~HBA_target.cwl~.
+The JSON file will also need to be modified to point the pipeline to the calibration solutions, as such:
+
+#+BEGIN_EXAMPLE
+{
+    "msin": [
+        {"class": "Directory", "path": "/path/to/data_01.MS"},
+        {"class": "Directory", 'path": "/path/to/data_02.MS"},
+        ...
+        ],
+    "cal_solutions": {"class": "File", "path": "cal_solutions.h5"}
+}
+#+END_EXAMPLE
+
+
+* WSclean
+
+Software is included in the LINC Singularity container - this needs to be active to run WSClean.
+
+** Basic Imaging Command
+
+#+BEGIN_src bash
+wsclean \
+-mgain 0.8 \           # Cleaning parameters.
+-auto-mask 10 \
+-pol I \
+-maxuv-l 8000 \
+-auto-threshold 3 \
+-weight briggs -0.5 \
+-niter 100000 \
+-weighting-rank-filter 3.0 \
+-fit-beam \
+-reorder \
+-clean-border 0 \
+-apply-primary-beam \
+-join-channels \
+-no-update-model-required \
+-name <name> \        # User parameters.
+-channels-out 6 \
+-size 2048 2048 \
+-scale 1asec \
+*.ms | tee imaging.log
+#+END_src
+
+Timeslicing
+#+BEGIN_SRC bash
+-reorder --> -no-reorder
+-intervals-out X            # Split observation into X chunks.
+-interval A B               # Only use slices A to B of the whole dataset, splitting it into X chunks.
+#+END_src
+
+** msoverview
+
+~msoverview in=file.ms (verbose=T)~
+View detailed information about the measurement sets. I believe this command is part of CASA, or in the Singularity container.
+
+** Output
+Produces primary beam images, dirty, model, individual beam visibilities for each outputted timeslice and per frequency channel requested.
+
+*-image-pb.fits are the files most interesting to us.
+
+Example Recent Run
+#+BEGIN_src bash
+wsclean \
+-mgain 0.8 \
+-auto-mask 10 \
+-pol I \
+-maxuv-l 8000 \
+-auto-threshold 3 \
+-weight-briggs -0.5 \
+-niter 100000 \
+-weighting-rank-filter 3.0 \
+-clean-border 0 \
+-fit-beam \
+-apply-primary-beam \
+-channel-division-frequencies 1.37e8,1.6e8 \
+-channels-out 1
+-reorder \
+-update-model-required \
+-name midf_wholetime_noslice \
+-size 2048 2048
+-scale 1asec \
+*.ms
+#+END_src
+
+
+* Struis
+
+Struis - Amsterdam HPC system. You'll need to acquire login details for this.
+
+** Struis login
+Login to struis, picking a random port between 1024 and 65000:
+~ssh -L 2505:localhost:2505 ahennessey@struis.science.uva.nl~
+~pass: rad_j~
+
+* TRAP
+
+Software for analysing LOFAR data.
+
+For Python3 - setup is easier (I've saved the word to Documents somewhere but requires asking antonia for a python3 database I believe)
+
+** Installation -- for tkp4.0 / python2.7 version
+
+Clone latest version from Github.
+~git clone https://github.com/transientskp/tkp.git~
+
+Create a virtualenv if you don't already have one and source it. TraP 5.0 runs on Python2 still so ensure virtualenv is setup accordingly.
+#+begin_src zsh
+virtualenv trap_env_2023 --python=python2.7
+
+
+conda activate
+#+end_src
+
+Install Jupyter notebook.
+#+begin_src bash
+pip install --upgrade pip
+pip install notebook
+#+end_src
+
+Install boost
+#+begin_src bash
+conda install -c conda-forge boost
+#+end_src
+
+*Changing TraP version*
+Install tkp with developer mode with the '-e' tag, meaning we can use the Git checkout feature.
+#+begin_src zsh
+cd ~/tkp
+pip install -e ".[pixelstore]"
+git tag             # Shows all available tags.
+git checkout r5.0   # 5.0 is the python 2.7 version I think current banana uses
+#+end_src
+
+*** TODO change commands to conda create env commands
+
+** Setting up TRAP
+
+Ensure you're the virtual environment you setup.
+
+#+begin_src shell
+# initialise a new project (only do once?)
+trap-manage.py initproject promptradio
+
+# create a new database
+creatdb -h vlo.science.uva.nl -U ahennessey <databasename>
+<postgresql password>
+
+# edit pipeline.cfg
+
+# initialise the databse with tkp
+trap-manage.py initdb
+#+end_src
+
+*** TKP PostgreSQL Login Details
+~ahennessey~
+~5tF69ShycX~
+
+
+** Using TRAP
+
+#+begin_src shell
+# initialise the job
+trap-manage.py initjob <jobname>
+
+# edit config files
+./<jobnames>/job_params.cfg # job parameters
+./<jobnames>/images_to_process.py # point to image files
+
+# run the pipeline
+trap-manage.py run <jobname>
+
+# for monitoring a position, can supply specific coordinates
+trap-manage.py run [-m MONITOR_COORDS] [-l COORDS_FILE] <jobname>
+
+# MONITOR COORDS -> a list of ra, dec coordinates in JSON format (decima degrees)
+#                -> [[203.234, 120.234], [123.704, 090.234]]
+# COORDS_FILE -> specify a file containing a json formatted list of coordinates as above
+
+# output to logfile rather than terminal and track it
+nohup trap-manage.py run <jobname> > trap_output.log &
+tail -f trap_output.log
+#end_src
+
+* PostgreSQL
+
+General information and commands for PostgreSQL can be found at: [[file:software.org::*PostgreSQL][software.org/postgresql]]
+
+LOFAR specific useful commands:
+#+begin_src shell
+# access psql terminal
+psql -U ahennessey -h vlo.science.uva.nl -d <databasename>
+#+end_src
+
+** Deleting databases
+Access the database as above, then after using ~\dt~ to list tables, you can use ~DELETE FROM table;~ to remove each table. You will find a series of linked foreign keys, just delete the table that it's referencing from one by one until all is gone.
+
+[[~/org/guides/software.org::* Solving foreign key issues][Foreign key issues!]]
+
+* Banana
+
+Used for viewing the ran files from TRAP.
+
+*** Banana login details
+~lofartkp~
+~grs1915~
